@@ -1,7 +1,7 @@
 from multiprocessing import Pool, cpu_count
 import sys
 from collections import namedtuple
-from typing import NamedTuple
+from typing import NamedTuple, List, Union, Optional, Dict
 
 import numpy as np
 import pandas as pd
@@ -17,7 +17,8 @@ from indicators import get_ATR, get_signals  # noqa
 
 def plot(*data):
     """
-    Plot every Series or column of given DataFrame on a separate vertical sub-plot.
+    Plot every Series or column of given DataFrame on a separate vertical
+    sub-plot.
 
     Args:
         Must be one or more Series or one DataFrame.
@@ -30,7 +31,7 @@ def plot(*data):
         elif isinstance(d, pd.DataFrame):
             columns.extend([d[c] for c in d.columns])
         else:
-            raise ValueError('Arguments must be Series or Dataframes')
+            raise ValueError('Arguments must be Series or a Dataframe')
     # plot the charts
     fig = plt.figure(figsize=(20, 16))
     num_plots = len(columns)
@@ -66,6 +67,7 @@ def chart_price(price_series, signal_series, threshold=0):
 def daily_returns(pnl, start=0):
     """
     Calculate daily returns from a series of intra-day pnl data.
+
     Pnl can be given in points or in dollars. Start is either initial
     portfolio value or first price in the series.
     """
@@ -83,10 +85,29 @@ def daily_returns(pnl, start=0):
     return daily
 
 
+def daily_returns_pct_based(pnl: pd.Series, price: pd.Series) -> pd.DataFrame:
+    data = pd.DataFrame({'pnl': pnl, 'price': price})
+    daily = data.resample('B').agg({'pnl': 'sum', 'price': 'first'}).dropna()
+    daily['returns'] = daily['pnl'] / daily['price']
+    daily['balance'] = (daily['returns'] + 1).cumprod()
+    return daily
+
+
+def daily_returns_log_based(df: pd.DataFrame) -> pd.DataFrame:
+    data = pd.DataFrame({'pnl': df.pnl, 'price': df.price,
+                         'lreturn': df.lreturn})
+    daily = data.resample('B').agg({'pnl': 'sum', 'price': 'first',
+                                    'lreturn': 'sum'}).dropna()
+    daily['returns'] = np.exp(daily['lreturn']) - 1
+    daily['balance'] = (daily['returns'] + 1).cumprod()
+    return daily
+
+
 def pos(price: pd.Series,
         transaction: pd.Series,
         position: pd.Series,
-        reason: pd.Series = None) -> NamedTuple:
+        reason: pd.Series = None,
+        cost: float = 0) -> NamedTuple:
     """
     Match open and close transactions to create position list.
 
@@ -126,7 +147,7 @@ def pos(price: pd.Series,
         closes['reason'] = (_closes.reset_index())['reason']
 
     positions = opens.join(closes, how='outer', lsuffix='_o', rsuffix='_c')
-    positions['pnl'] = -(positions['open'] + positions['close'])
+    positions['pnl'] = -(positions['open'] + positions['close']) - cost*2
     positions['duration'] = positions['date_c'] - positions['date_o']
     Results = namedtuple('Result', 'positions, opens, closes, transactions')
     return Results(positions, opens, closes, transactions)
@@ -158,11 +179,25 @@ def compound_pnl(df,  bankroll):
                  (df.loc[i, 'position'] != 0))
                 | (df.loc[i, 'pnl_dollars'] != 0))
 
-        df.loc[i, 'comp_pnl_dollars'] = df.loc[i,
-                                               'size'] * df.loc[i, 'pnl_dollars']
+        df.loc[i, 'comp_pnl_dollars'] = df.loc[
+            i, 'size'] * df.loc[i, 'pnl_dollars']
         df.loc[i, 'balance'] = df.loc[:i, 'comp_pnl_dollars'].sum() + bankroll
     df.set_index('date', inplace=True)
     return df
+
+
+def get_min_tick(data: pd.Series) -> float:
+    """
+    Estimate min_tick value from price data.
+
+    Args:
+       data: price series
+    """
+    ps = data.sort_values().diff().abs().dropna()
+    ps = ps[ps != 0]
+    min_tick = ps.mode()[0]
+    # print(f'estimated min-tick: {min_tick}')
+    return min_tick
 
 
 def perf(df: pd.DataFrame,
@@ -170,20 +205,24 @@ def perf(df: pd.DataFrame,
          bankroll: float = 15000,
          output: bool = True,
          compound: bool = False,
-         price_column_name: str = 'price') -> NamedTuple:
+         price_column_name: str = 'price',
+         slippage: float = 0) -> NamedTuple:
     """
     Extract performance indicators from simulation done by other functions.
 
     Args:
         df:         must have columns: 'price', 'position', all the information
+                    about when and at what price position is entered and closed
                     is extracted from those two columns
         multiplier: futures multiplier to be used in fixed capital simulation,
-                    if not given or zero simulation will be variable capital without
-                    leverage
+                    if not given or zero simulation will be variable capital
+                    without leverage
         output:     whether output is to be printed out
         compound:   for fixed capital simulation whether position size should
                     be adjusted based on current balance, ignored for variable
                     capital simulation
+        price_column_name: which column in df contains price data
+        slippage:   transaction cost expressed as multiple of min-tick
 
     Returns:
         Named tuple of resulting DataFrames for inspection:
@@ -194,15 +233,31 @@ def perf(df: pd.DataFrame,
         df: source df with signals (for debugging really)
     """
     df = df.copy()
-    if price_column_name is not 'price':
+    if price_column_name != 'price':
         df.rename(columns={price_column_name: 'price'}, inplace=True)
 
-    df['transaction'] = ((df['position'] - df['position'].shift(1)
-                          ).fillna(0)).astype('int')
+    if slippage:
+        cost = get_min_tick(df.price) * slippage
+    else:
+        cost = 0
+
+    df['transaction'] = (df['position'] - df['position'].shift(1)
+                         .fillna(0)).astype('int')
+
+    df['slippage'] = df['transaction'].abs() * cost
+    if (df.position[-1] != 0):  # & (df.transaction[-1] == 0):
+        df.slippage[-1] += np.abs(df.position[-1]) * cost
+
     df['curr_price'] = (df['position'] - df['transaction']) * df['price']
+
     df['base_price'] = (df['price'].shift(
         1) * df['position'].shift(1)).fillna(0)
-    df['pnl'] = df['curr_price'] - df['base_price']
+    df['pnl'] = df['curr_price'] - df['base_price'] - df['slippage']
+
+    slip_return = np.log((-df['slippage'] / df['price']) + 1).fillna(0)
+    price_return = np.log(((df['curr_price'] - df['base_price'])
+                           / abs(df['base_price'])) + 1).fillna(0)
+    df['lreturn'] = slip_return + price_return
 
     # get daily returns
     if multiplier:
@@ -217,18 +272,22 @@ def perf(df: pd.DataFrame,
         else:
             daily = daily_returns(df['pnl_dollars'], bankroll)
     else:
-        daily = daily_returns(df['pnl'], df.price[0])
+        daily = daily_returns_log_based(df)
 
     # get position stats
     if 'reason' in df.columns:
         p = pos(df['price'], df['transaction'],
-                df['position'], df['reason'].shift(1))
+                df['position'], df['reason'].shift(1), cost=cost)
     else:
-        p = pos(df['price'], df['transaction'], df['position'])
+        p = pos(df['price'], df['transaction'], df['position'], cost=cost)
     positions = p.positions
+    assert round(positions.pnl.sum(), 4) == round(df.pnl.sum(), 4), \
+        f'Dubious pnl calcs... {positions.pnl.sum()} vs. {df.pnl.sum()}'
+
     if multiplier:
         positions['pnl'] = positions['pnl'] * multiplier
-    pnl = positions['pnl'].sum()
+    # pnl = positions['pnl'].sum()
+
     duration = positions['duration'].mean()
     win_pos = positions[positions['pnl'] > 0]
     # positions with zero gain are loss making
@@ -272,13 +331,23 @@ def perf(df: pd.DataFrame,
 
 def perf_var(df: pd.DataFrame,
              output: bool = True,
-             price_column_name='price'):
+             price_column_name: str = 'price',
+             slippage: int = 0):
     """
     Shortcut interface function for perf to generate variable capital
     simulation.
+
+    Args:
+        df:         must have columns: 'price', 'position', all the information
+                    about when and at what price position if entered and closed
+                    is extracted from those two columns
+        output:     whether output is to be printed out
+        price_column_name: which column in df contains price data
+
     """
 
-    return perf(df, output=output, price_column_name=price_column_name)
+    return perf(df, output=output, price_column_name=price_column_name,
+                slippage=slippage)
 
 
 def v_backtester(price: pd.Series,
@@ -304,6 +373,7 @@ def v_backtester(price: pd.Series,
     Returns:
        DataFame with columns: 'signal', 'position'
     """
+
     df = pd.DataFrame({'price': price,
                        'indicator': indicator})
     df['signal'] = ((df['indicator'] > threshold) * 1) \
@@ -327,7 +397,8 @@ def c_backtester(data: pd.DataFrame,
        - position can be taken on the next row after signal is generated
        - stop-losse (either relative to entry or high water mark)
        - filtered_signal if given allows for additional condition that must
-         be met to initiate position. Positions are closed regardless of filter.
+         be met to initiate position. Positions are closed regardless of
+         filter.
 
     Args:
         data:        must have columns: 'price', 'close', 'signal', 'atr';
@@ -336,21 +407,24 @@ def c_backtester(data: pd.DataFrame,
                      'price' used for transactions
                      'close' to decide whether stop-loss has been triggered
         sl_atr:      stop-loss distance in multiples of ATRs
-                     (if no stop loss required use very high number, default 50)
+                     (if no stop loss required use very high number,
+                      default 50)
         trailing_sl: if True, stop-loss calculated off high watermark,
                      if False, entry price
-        active_close: if True close signal is the signal opposite to the direction
-                      of the position, if False close signal is lack of signal in
+        active_close: if True close signal is the signal opposite to the
+                      direction of the position, if False close signal is
+                      lack of signal in
                       the direction of the position
-        block_stop:  if True, after stop loss no position will be entered in the same
-                     same direction as stoped out position until opposite signal
-                     is generated
-        take_profit: take profit distance expressed as multiple of stop-loss distance,
-                     0 means no take profit
+        block_stop:  if True, after stop loss no position will be entered in
+                     the same same direction as stoped out position until
+                     opposite signal is generated
+        take_profit: take profit distance expressed as multiple of stop-loss
+                     distance, 0 means no take profit
 
     Returns:
         DataFrame with column 'position' to be processed by another function.
     """
+
     for c in ['price', 'close', 'signal', 'atr']:
         assert c in data.columns, f"'{c}' is a required column"
 
@@ -450,14 +524,16 @@ def c_backtester(data: pd.DataFrame,
             # long positions
             if data.loc[item.Index, 'position'] > 0:
                 if item.close >= (
-                        data.loc[item.Index, 'entry'] + (item.atr * sl_atr * take_profit)):
+                        data.loc[item.Index, 'entry'] +
+                        (item.atr * sl_atr * take_profit)):
                     data.loc[item.Index, 'mark'] = True
                     data.loc[item.Index, 'reason'] = 'take-profit'
                     block = 1
             # short positions
             if data.loc[item.Index, 'position'] < 0:
                 if item.close <= abs(
-                        (data.loc[item.Index, 'entry'] + (item.atr * sl_atr * take_profit))):
+                        (data.loc[item.Index, 'entry'] +
+                         (item.atr * sl_atr * take_profit))):
                     data.loc[item.Index, 'mark'] = True
                     data.loc[item.Index, 'reason'] = 'take-profit'
                     block = -1
@@ -476,7 +552,8 @@ def c_backtester(data: pd.DataFrame,
 def true_sharpe(ret):
     """
     Given Series with daily returns (simple, non-log ie. P1/P0-1),
-    return indicators comparing simplified Sharpe to 'true' Sharpe.
+    return indicators comparing simplified Sharpe to 'true' Sharpe
+    (defined by different caluclation conventions).
     """
     r = pd.Series()
     df = pd.DataFrame({'returns': ret})
@@ -610,3 +687,52 @@ def m_proc(dfs, func):
     results = [pool.apply_async(func, args=(df,)) for df in dfs]
     output = [p.get() for p in results]
     return output
+
+
+out = NamedTuple('Out', [('stats', pd.DataFrame),
+                         ('dailys', pd.DataFrame),
+                         ('returns', pd.DataFrame),
+                         ('positions', Dict[float, pd.DataFrame]),
+                         ('dfs', pd.DataFrame),
+                         ])
+
+
+def summary(price: Union[pd.Series, pd.DataFrame],
+            indicator: Optional[pd.Series] = None,
+            slip: float = 0,
+            threshold: Optional[Union[List, float]] = None) -> out:
+    """
+    Return stats summary of strategy for various thresholds
+    run on the indicator. The strategy is long when indicator > threshold
+    and short when indicator < -threshold.
+
+    Trades are executed on the given price. Price and indicator
+    must have the same index.
+    """
+
+    if isinstance(price, pd.DataFrame) and indicator is None:
+        indicator = price.forecast
+        price = price.open
+
+    if threshold is None:
+        threshold = [0, 3, 5, 6, 7, 10, 15, 17, 19, 20]
+    elif isinstance(threshold, (int, float)):
+        threshold = [threshold]
+
+    stats = pd.DataFrame()
+    dailys = pd.DataFrame()
+    returns = pd.DataFrame()
+    positions = {}
+    dfs = {}
+    for i in threshold:
+        try:
+            b = v_backtester(price, indicator, i)
+            r = perf_var(b, False, slippage=slip)
+        except ZeroDivisionError:
+            continue
+        stats[i] = r.stats
+        dailys[i] = r.daily.balance
+        returns[i] = r.daily['returns']
+        positions[i] = r.positions
+        dfs[i] = r.df
+    return out(stats, dailys, returns, positions, dfs)

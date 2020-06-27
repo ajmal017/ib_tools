@@ -1,42 +1,130 @@
-from functools import partial
-from typing import List, Dict, Union, Optional
 from abc import ABC, abstractmethod
+from typing import List, Dict, Union, Optional, Tuple, Any, DefaultDict
+from functools import partial
+from collections import defaultdict
 import pickle
 
 import pandas as pd
-from ib_insync.contract import Future, ContFuture, Contract
-from arctic import Arctic
-from arctic.exceptions import NoDataFoundException
-from arctic.store.versioned_item import VersionedItem
-from arctic.date import DateRange
 from logbook import Logger
+from arctic.date import DateRange
+from arctic.store.versioned_item import VersionedItem
+from arctic.exceptions import NoDataFoundException
+from arctic import Arctic
+from ib_insync.contract import Future, ContFuture, Contract
 
 from config import default_path
+
 
 log = Logger(__name__)
 
 
+def symbol_extractor(func):
+    """
+    Not in use. TODO.
+    """
+    def wrapper(symbol, *args, **kwargs):
+        if isinstance(symbol, Contract):
+            symbol = f'{"_".join(symbol.localSymbol.split())}_{symbol.secType}'
+        return func(symbol, *args, **kwargs)
+    return wrapper
+
+
 class AbstractBaseStore(ABC):
+    """
+    Interface for accessing datastores. To be inherited by particular store
+    type implementation.
+    """
 
     @abstractmethod
     def write(self, symbol: Union[str, Contract]):
+        """
+        Write data to datastore. Implementation has to recognize whether
+        string or Contract was passed, extract metadata and save it in
+        implementation specific format. Implementation is responsible
+        for veryfying and cleaning data. In principle, if symbol exists
+        in store data is to be overriden (different behaviour possible in
+        implementations).
+        """
         pass
 
     @abstractmethod
-    def read(self, symbol: Union[str, Contract]):
+    def read(self, symbol: Union[str, Contract],
+             start_date: Optional[str] = None, end_date: Optional[str] = None
+             ) -> Optional[pd.DataFrame]:
+        """
+        Read data from store for a given symbol. Implementation has to
+        recognize whether str or Contract was passed and read metadata
+        in implementation specific manner.
+
+        Return df with data or None if the symbol is not in datastore.
+        """
+        pass
+
+    @abstractmethod
+    def delete(self, symbol: Union[str, Contract]):
+        """
+        Implementation responsible for distinguishing between str and Contract.
+        """
         pass
 
     @abstractmethod
     def keys(self) -> List[str]:
+        """Return a list of symbols available in store."""
         pass
 
-    def _symbol(self, obj: Union[Contract, str]) -> str:
-        if isinstance(obj, Contract):
-            return f'{obj.localSymbol}_{obj.secType}'
-        else:
-            return obj
+    @abstractmethod
+    def read_metadata(self, symbol: Union[Contract, str]) -> Dict:
+        """
+        Public method for reading metadata for given symbol.
+        Implementation must distinguish between str and Contract.
+        """
+        pass
 
-    def _metadata(self, obj: Union[Contract, str]):
+    @abstractmethod
+    def write_metadata(self, symbol: Union[Contract, str], meta: Dict) -> Any:
+        """
+        Public method for writing metadata for given symbol.
+        Implementation must distinguish between str and Contract.
+        Metadata should be updated rather than overriden.
+        """
+        pass
+
+    @abstractmethod
+    def override_metadata(self, symbol: str, meta: Dict[str, Any]) -> Any:
+        """
+        Delete any existing metadata for symbol and replace it with meta.
+        """
+        pass
+
+    def _symbol(self, sym: Union[Contract, str]) -> str:
+        """
+        If Contract passed extract string that is used as key.
+        Otherwise return the string passed.
+        """
+        if isinstance(sym, Contract):
+            return f'{"_".join(sym.localSymbol.split())}_{sym.secType}'
+        else:
+            return sym
+
+    def _update_metadata(self, symbol: Union[Contract, str],
+                         meta: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        To be used in implementations that override metadata. Read existing
+        metadata, update by meta and return updated dictionary. Relies on
+        other methods to actually write the updated metadata.
+        """
+        _meta = self.read_metadata(symbol)
+        if _meta:
+            _meta.update(meta)
+        else:
+            _meta = meta
+        return _meta
+
+    def _metadata(self, obj: Union[Contract, str]) -> Dict[str, Any]:
+        """
+        If Contract passed extract metadata into a dict.
+        Otherwise return empty dict.
+        """
         if isinstance(obj, Contract):
             return {**obj.nonDefaults(),
                     **{'repr': repr(obj),
@@ -45,23 +133,181 @@ class AbstractBaseStore(ABC):
         else:
             return {}
 
+    def delete_metadata_item(self, symbol: str, key: str) -> Any:
+        """
+        Delete an entry from metadata for a given symbol.
+        Return None if symbol or key not present in datastore.
+        """
+        meta = self.read_metadata(symbol)
+        if meta:
+            try:
+                del meta[key]
+            except KeyError:
+                return None
+            return self.override_metadata(symbol, meta)
+
     @staticmethod
-    def _clean(df):
+    def _clean(df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure no duplicates and ascending sorting of diven df."""
         df = df.sort_index(ascending=True)
         df.drop(index=df[df.index.duplicated()].index, inplace=True)
         return df
 
-    def check_earliest(self, symbol):
+    def check_earliest(self, symbol: str) -> pd.datetime:
+        """Return earliest date of available data for a given symbol."""
         try:
             return self.read(symbol).index.min()
         except (KeyError, AttributeError):
             return None
 
-    def check_latest(self, symbol):
+    def check_latest(self, symbol: str) -> pd.datetime:
+        """Return earliest date of available data for a given symbol."""
         try:
             return self.read(symbol).index.max()
         except (KeyError, AttributeError):
             return None
+
+    def date_range(self) -> pd.DataFrame:
+        """
+        For every key in datastore return start date and end date of
+        available data.
+        """
+        range = {}
+        for key in self.keys():
+            df = self.read(key)
+            range[key] = (df.index[0], df.index[-1])
+        return pd.DataFrame(range).T.rename(columns={0: 'from', 1: 'to'})
+
+    def review(self, *field: str) -> pd.DataFrame:
+        """
+        Return df with date_range together with some contract details.
+        """
+        fields = ['symbol', 'tradingClass',
+                  'currency', 'min_tick', 'lastTradeDateOrContractMonth',
+                  'name']
+        if field:
+            fields.extend(field)
+        df = self.date_range()
+        details = defaultdict(list)
+        for key in df.to_dict('index').keys():
+            meta = self.read_metadata(key)
+            for f in fields:
+                details[f].append('' if meta is None else meta.get(f))
+        for k, v in details.items():
+            df[k] = v
+        return df
+
+    def _contfutures(self) -> List[str]:
+        """Return keys that correspond to contfutures"""
+        return [c for c in self.keys() if c.endswith('CONTFUT')]
+
+    def _contfutures_dict(self, field: str = 'tradingClass'
+                          ) -> DefaultDict[str, Dict[pd.datetime, str]]:
+        """
+        Args:
+        ----------
+        field: which metadata field is to be used as a key in returned dict
+
+        Returns:
+        ----------
+        dictionary, where:
+              keys: field (default: 'tradingClass') for every contfuture,
+                    if to be used to lookup future in ib, 'symbol' should be
+                    used
+              values: dict of expiry date: symbol sorted ascending by expiry
+                      date
+        """
+        contfutures = defaultdict(dict)
+        for cf in self._contfutures():
+            meta = self.read_metadata(cf)
+            date = pd.to_datetime(meta['lastTradeDateOrContractMonth'])
+            contfutures[meta[field]].update({date: cf})
+
+        # sorting
+        ordered_contfutures = defaultdict(dict)
+        for k, v in contfutures.items():
+            for i in sorted(v):
+                ordered_contfutures[k].update({i: v[i]})
+
+        # for k, v in contfutures.items():
+        #    contfutures[k] = sorted(v, key=lambda x: x[0])
+        return ordered_contfutures
+
+    def latest_contfutures(self, index: int = -1,
+                           field: str = 'tradingClass') -> Dict[str, str]:
+        """
+        Return a dictionary of contfutures for every tradingClass
+        {tradingClass: symbol}. Relies on self._contfutures_dict.values()
+        sorted ascending.
+
+        Args:
+        ----------
+        index: -1 means most recent contract, -2 second most recent, etc.
+                Oldest available contract if index is lower than the number of
+                available contracts.
+        field: which field of metadata dict is to be searched
+
+        Returns:
+        ----------
+        Dictionary of {symbol: datastore key}
+
+        """
+        if index > 0:
+            raise ValueError('index must be <= 0')
+
+        _latest_contfutures = {}
+        for c, d in self._contfutures_dict(field).items():
+            keys_list = list(d.keys())
+            if len(keys_list) + index < 0:
+                index = 0
+            _latest_contfutures[c] = d[keys_list[index]]
+        return _latest_contfutures
+
+    def contfuture(self, symbol: str, index: int = -1,
+                   field: str = 'tradingClass',
+                   start_date: Optional[str] = None,
+                   end_date: Optional[str] = None) -> pd.DataFrame:
+        """
+        Return data for latest contfuture for symbol
+
+        Args:
+        ----------
+        symbol: symbol to look-up
+        field (default: 'tradingClass'): which field of metadata dict is to be
+              looked-up
+        index: -1 for latest contract, -2 for second latest, etc.
+        start_date:
+        end_date:
+
+        Returns:
+        ----------
+        DataFrame with price/volume data for given contract.
+        """
+        return self.read(self.latest_contfutures(index, field)[symbol],
+                         start_date, end_date)
+
+    def contfuture_contract_object(self, symbol: str, index: int = -1,
+                                   field: str = 'tradingClass'
+                                   ) -> Optional[Contract]:
+        """
+        Return ib_insync object for latest contfuture for given exchange symbol
+        (tradingClass).
+
+        Usage:
+        contfuture_contract_object('NQ')
+        Returns:
+        ContFuture(conId=371749745, symbol='NQ',
+        lastTradeDateOrContractMonth='20200918', multiplier='20',
+        exchange='GLOBEX', currency='USD', localSymbol='NQU0',
+        tradingClass='NQ')
+        """
+        meta = self.read_metadata(
+            self.latest_contfutures(index, field).get(symbol))
+        if meta:
+            try:
+                return pickle.loads(meta['object'])
+            except TypeError:
+                return
 
 
 class ArcticStore(AbstractBaseStore):
@@ -85,45 +331,83 @@ class ArcticStore(AbstractBaseStore):
         version = self.store.write(
             self._symbol(symbol),
             self._clean(data),
-            metadata=metadata)
+            metadata=self._update_metadata(symbol, metadata))
         if version:
             return f'symbol: {version.symbol} version: {version.version}'
-        return version
 
-    def read(self, symbol: Union[str, Contract]) -> Optional[pd.DataFrame]:
+    def read(self, symbol: Union[str, Contract],
+             start_date: Optional[str] = None, end_date: Optional[str] = None
+             ) -> Optional[pd.DataFrame]:
         try:
-            return self.read_object(symbol).data
-        except AttributeError:
+            return self.read_object(symbol, start_date, end_date).data
+        except (AttributeError, NoDataFoundException):
             return None
 
-    def read_object(self, symbol: Union[str, Contract]
+    def read_object(self, symbol: Union[str, Contract],
+                    start_date: Optional[str] = None,
+                    end_date: Optional[str] = None
                     ) -> Optional[VersionedItem]:
+        """
+        Return Arctic object, which contains data and full metadata.
+
+        This object has properties: symbol, library, data, version,
+        metadata, host.
+
+        Metadata is a dict with its properties mostly copied from ib.
+        It's keys are: secType, conId, symbol,
+        lastTradeDateOrContractMonth, multiplier, exchange, currency,
+        localSymbol, tradingClass, repr, object.
+        It can also be updated by utils function to contain additional
+        details.
+
+        Repr is __repr__() of ib contract object.
+        Object is the actual ib contract object.
+        """
+        date_range = DateRange(start_date, end_date)
         try:
-            return self.store.read(self._symbol(symbol))
+            return self.store.read(self._symbol(symbol), date_range=date_range)
         except NoDataFoundException:
             return None
+
+    def delete(self, symbol: Union[str, Contract]) -> None:
+        self.store.delete(self._symbol(symbol))
 
     def keys(self) -> List[str]:
         return self.store.list_symbols()
 
-    def read_metadata(self, symbol) -> Optional[Dict[str, Dict[str, str]]]:
+    def read_metadata(self, symbol: Union[str, Contract]
+                      ) -> Optional[Dict[str, Dict[str, str]]]:
         try:
-            return self.read_object(symbol).metadata
-        except AttributeError:
+            return self.store.read_metadata(self._symbol(symbol)).metadata
+        except (AttributeError, NoDataFoundException):
             return
+
+    def write_metadata(self, symbol: Union[Contract, str], meta: Dict[str, Any]
+                       ) -> Optional[VersionedItem]:
+        return self.store.write_metadata(self._symbol(symbol),
+                                         self._update_metadata(symbol, meta))
+
+    def override_metadata(self, symbol: str, meta: Dict[str, Any]
+                          ) -> Optional[VersionedItem]:
+        return self.store.write_metadata(symbol, meta)
 
     def _metadata(self, obj: Union[Contract, str]) -> Dict[str, Dict[str, str]]:
         if isinstance(obj, Contract):
             meta = super()._metadata(obj)
-            # meta.update({'object': pickle.dumps(obj)})
-            meta.update({'object': None})
+            meta.update({'object': pickle.dumps(obj)})
+            # Unconmment following line if pickled object is not to be saved
+            # Will make data unusable for backtester
+            # meta.update({'object': None})
         else:
             meta = {}
         return meta
 
 
 class PyTablesStore(AbstractBaseStore):
-    """Pandas HDFStore fixed format."""
+    """
+    Pandas HDFStore fixed format.
+    THIS HAS NOT BEEN TESTED AND LIKELY DOESN'T WORK PROPERLY. TODO.
+    """
 
     def __init__(self, lib: str, path: str = default_path) -> None:
         lib = lib.replace(' ', '_')
@@ -145,17 +429,20 @@ class PyTablesStore(AbstractBaseStore):
             data = store.get(self._symbol(symbol))
         return data
 
+    def delete(self, symbol: Union[str, Contract]) -> None:
+        self.store.remove(self._symbol(symbol))
+
     def keys(self) -> List[str]:
         with self.store() as store:
             keys = store.keys()
         return keys
 
-    def read_metadata(self, symbol):
+    def read_metadata(self, symbol: Union[str, Contract]) -> dict:
         """Return metadata for given symbol"""
         return self._read_meta()[self._symbol(symbol)]
 
-    def _read_meta(self):
-        """Return full metadata dictionary"""
+    def _read_meta(self) -> dict:
+        """Return full metadata dictionary (for all symbols)."""
         with open(self.metastore, 'rb') as metastore:
             meta = pickle.load(metastore)
         return meta

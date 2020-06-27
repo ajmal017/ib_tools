@@ -252,9 +252,11 @@ class DownloadContainer:
         if bars:
             self.bars.append(bars)
             self.current_date = bars[0].date
-        else:
+        elif self.current_date:
             # might be a bank holiday
             self.current_date -= timedelta(days=1)
+        else:
+            return
         if self.from_date < self.current_date < self.to_date:
             return self.current_date
 
@@ -295,11 +297,12 @@ class ContractHolder:
     @dataclass
     class __ContractHolder:
         ib: IB
-        source: str
+        source: str  # csv file name with contract list
         store: AbstractBaseStore
-        wts: str
-        barSize: str
-        cont_only: bool = False
+        wts: str  # whatToShow ib api parameter
+        barSize: str  # ib api parameter
+        cont_only: bool = False  # retrieve continuous contracts only
+        # how big series request at each call (1 = normal, 2 = double, etc.)
         aggression: int = 1
         items: Optional[List[DataWriter]] = None
 
@@ -310,16 +313,24 @@ class ContractHolder:
             else:
                 objects = objects.list
 
-            self.items = [
-                DataWriter(store,
-                           o,
-                           self.ib.reqHeadTimeStamp(
-                               o, whatToShow=self.wts, useRTH=False),
-                           barSize=self.barSize,
-                           wts=self.wts,
-                           aggression=self.aggression)
-                for o in objects
-            ]
+            self.items = []
+            for o in objects:
+                headTimeStamp = self.ib.reqHeadTimeStamp(
+                    o, whatToShow=self.wts, useRTH=False)
+                if headTimeStamp == []:
+                    log.warning(
+                        (f'Unavailable headTimeStamp for {o.localSymbol}. '
+                         f'No data will be downloaded')
+                    )
+                    continue
+                self.items.append(
+                    DataWriter(store,
+                               o,
+                               headTimeStamp,
+                               barSize=self.barSize,
+                               wts=self.wts,
+                               aggression=self.aggression)
+                )
 
         def __call__(self):
             if self.items is None:
@@ -379,7 +390,7 @@ def duration_in_secs(barSize: str):
 def duration_str(duration_in_secs: int, aggression: float,
                  from_bar: bool = True):
     """
-    Given duration in seconds return acceptable duration str. 
+    Given duration in seconds return acceptable duration str.
 
     :from_bar:
     if True it's assumed that the duration_in_secs number comes from barSize
@@ -454,8 +465,6 @@ async def main(holder: ContractHolder):
     contracts = holder()
     number_of_workers = min(len(contracts), max_number_of_workers)
 
-    asyncio.get_event_loop().set_debug(True)
-
     log.debug(f'main function started, '
               f'retrieving data for {len(contracts)} instruments')
 
@@ -473,36 +482,23 @@ async def main(holder: ContractHolder):
         w.cancel()
 
     # wait until all worker tasks are cancelled
-    await asyncio.gather(*workers, return_exceptions=True)
+    await asyncio.gather(*workers)
 
 
 if __name__ == '__main__':
     util.patchAsyncio()
     ib = IB()
-    barSize = '1 min'
-    wts = 'TRADES'
+    barSize = '30 secs'
+    wts = 'MIDPOINT'
     # object where data is stored
     store = ArcticStore(f'{wts}_{barSize}')
 
-    holder = ContractHolder(ib, '_contracts.csv',
-                            store, wts, barSize, True, 3)
+    holder = ContractHolder(ib, 'contracts.csv',
+                            store, wts, barSize, True)
 
-    asyncio.get_event_loop().set_debug(True)
+    # asyncio.get_event_loop().set_debug(True)
     Connection(ib, partial(main, holder), watchdog=False)
 
     log.debug('script finished, about to disconnect')
     ib.disconnect()
     log.debug(f'disconnected')
-
-
-"""
-    contracts = [
-        DataWriter(store,
-                   c,
-                   ib.reqHeadTimeStamp(c, whatToShow=wts, useRTH=False),
-                   barSize,
-                   wts,
-                   aggression=3)
-        for c in ContractObjectSelector(ib, '_contracts.csv').cont_list
-    ]
-"""
