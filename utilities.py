@@ -1,6 +1,9 @@
 from typing import Optional, Union, List
+from pathlib import Path
+from os import makedirs, path
 
-from ib_insync import IB, ContFuture, MarketOrder
+import numpy as np
+from ib_insync import IB, ContFuture, MarketOrder, Future
 from logbook import Logger
 
 from datastore import AbstractBaseStore
@@ -35,12 +38,23 @@ def update_details(ib: IB, store: AbstractBaseStore,
         contract.update(includeExpired=True)
         contracts[key] = contract
     ib.qualifyContracts(*contracts.values())
-    details = {k: ib.reqContractDetails(v)[0] for k, v in contracts.items()}
+    details = {}
+    for k, v in contracts.copy().items():
+        try:
+            details[k] = ib.reqContractDetails(v)[0]
+        except IndexError:
+            log.error(f'Contract unavailable: {k}')
+            del contracts[k]
 
     # get commission levels
     order = MarketOrder('BUY', 1)
-    commissions = {k: ib.whatIfOrder(v, order).commission
-                   for k, v in contracts.items()}
+    commissions = {}
+    for k, v in contracts.items():
+        try:
+            commissions[k] = ib.whatIfOrder(v, order).commission
+        except AttributeError:
+            log.error(f'Commission unavailable for: {k}')
+            commissions[k] = np.nan
 
     for c, d in details.items():
         _d = {'name': d.longName,
@@ -48,3 +62,18 @@ def update_details(ib: IB, store: AbstractBaseStore,
               'commission': commissions[c]
               }
         store.write_metadata(c, _d)
+
+    log.info('Data written to store.')
+
+
+def default_path(*dirnames: str) -> str:
+    """
+    Return path created by joining  ~/ib_data/ and recursively all dirnames
+    If the path doesn't exist create it.
+    Should also work in Windows but not tested.
+    """
+    home = Path.home()
+    dirnames_str = ' / '.join(dirnames)
+    if not Path.exists(home / 'ib_data' / dirnames_str):
+        makedirs(home.joinpath('ib_data', *dirnames))
+    return path.join(str(home), 'ib_data', *dirnames)

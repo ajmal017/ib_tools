@@ -51,6 +51,7 @@ class IBHandlers:
         ib.barUpdateEvent += self.onBarUpdate
         ib.newOrderEvent += self.onNewOrder
         ib.orderModifyEvent += self.onOrderModify
+        ib.cancelOrderEvent += self.onCancelOrder
         ib.openOrderEvent += self.onOpenOrder
         ib.orderStatusEvent += self.onOrderStatus
         ib.execDetailsEvent += self.onExecDetails
@@ -90,50 +91,62 @@ class IBHandlers:
         pass
 
     def onNewOrder(self, trade: Trade):
-        pass
+        log.info(f'New order: {trade.contract.localSymbol} {trade.order}')
 
     def onOrderModify(self, trade: Trade):
-        pass
+        log.info(
+            f'Order modified: {trade.contract.localSymbol} {trade.order}')
 
-    def onCancelledOrder(self, trade: Trade):
-        pass
+    def onCancelOrder(self, trade: Trade):
+        log.info(
+            f'Order canceled: {trade.contract.localSymbol} {trade.order}')
 
     def onOpenOrder(self, trade: Trade):
         pass
 
     def onOrderStatus(self, trade: Trade):
-        pass
+        log.info(f'Order status {trade.contract.localSymbol} '
+                 f'{trade.order.action} {trade.order.totalQuantity} '
+                 f'{trade.order.orderType} - '
+                 f'{trade.orderStatus.status} - '
+                 f'(t: {trade.order.totalQuantity} '
+                 f'f: {trade.orderStatus.filled} '
+                 f'r: {trade.orderStatus.remaining})')
 
     def onExecDetails(self, trade: Trade, fill: Fill):
         pass
 
     def onCommissionReport(self, trade: Trade, fill: Fill,
                            report: CommissionReport):
-        log.debug(f'Commission report: {report}')
+        # log.debug(f'Commission report: {report}')
+        pass
 
     def onUpdatePortfolio(self, item: PortfolioItem):
         realized = round(item.realizedPNL, 2)
         unrealized = round(item.unrealizedPNL, 2)
         total = round(realized + unrealized)
         report = (item.contract.localSymbol, realized, unrealized, total)
-        log.info(f'Portfolio item: {report}')
+        log.debug(f'Portfolio item: {report}')
         self.portfolio_items[item.contract.localSymbol] = (
             realized, unrealized, total)
 
     def onPosition(self, position: Position):
-        log.info(f'Position update: {position}')
+        log.debug(f'Position update: {position.contract.localSymbol}: '
+                  f'{position.position}, avg cost: {position.avgCost}')
 
     def onAccountValue(self, value: AccountValue):
-        pass
+        if value.tag == 'NetLiquidation':
+            log.debug(value)
 
     def onAccountSummary(self, value: AccountValue):
         """
         tags = ['UnrealizedPnL', 'RealizedPnL', 'FuturesPNL',
                 'NetLiquidationByCurrency']
         """
-        tags = ['NetLiquidationByCurrency']
-        if value.tag in tags:
-            log.info(f'{value.tag}: {value.value}')
+        # tags = ['NetLiquidationByCurrency']
+        # if value.tag in tags:
+        #    log.info(f'{value.tag}: {value.value}')
+        pass
 
     def onPnl(self, entry: PnL):
         pass
@@ -153,11 +166,12 @@ class IBHandlers:
     def onError(self, reqId: int, errorCode: int, errorString: str,
                 contract: Contract):
         if errorCode not in (2157, 2158, 2119, 2104, 2106, 165, 2108,
-                             2103, 2105):
+                             2103, 2105, 10182, 1100):
             log.error(f'ERROR: {errorCode} {errorString} {contract}')
 
     def onTimeout(self, idlePeriod: float):
         pass
+        #log.error(f'Timeout! Idle period: {idlePeriod}')
 
     def onScheduledUpdate(self, time):
         log.info(f'pnl: {self.ib.pnl()}')

@@ -12,7 +12,7 @@ log = Logger(__name__)
 
 class BarStreamer(ABC):
 
-    durationStr = '15 D'
+    durationStr = '12 D'
     barSizeSetting = '30 secs'
     whatToShow = 'TRADES'
     useRTH = False
@@ -50,7 +50,8 @@ class BarStreamer(ABC):
             whatToShow=self.whatToShow,
             useRTH=self.useRTH,
             formatDate=1,
-            keepUpToDate=True)
+            keepUpToDate=True,
+            timeout=0)
 
     def subscribe(self) -> None:
         self.bars.updateEvent += self.onNewBar
@@ -100,17 +101,15 @@ class StreamAggregator(BarStreamer):
         df = util.df(self.new_bars)
         df.date = df.date.astype('datetime64')
         df.set_index('date', inplace=True)
-        # df['backfill'] = True
-        # df['volume_weighted'] = (df.close + df.open)/2 * df.volume
-        # df['volume_weighted'] = df.close * df.volume
-        # df['volume_weighted'] = df.average * df.volume
-        # weighted_price = df.volume_weighted.sum() / df.volume.sum()
+        df['volume_weighted'] = df.average * df.volume
+        weighted_price = df.volume_weighted.sum() / df.volume.sum()
         self.newCandle.emit({'backfill': self.backfill,
                              'date': df.index[-1],
                              'open': df.open[0],
                              'high': df.high.max(),
                              'low': df.low.min(),
                              'close': df.close[-1],
+                             'weighted_price': weighted_price,
                              # 'price': weighted_price,
                              'price': df.close[-1],
                              'volume': df.volume.sum()})
@@ -142,7 +141,10 @@ class VolumeStreamer(StreamAggregator):
         self.aggregator = 0
 
     def __call__(self, ib: IB, contract: Contract) -> None:
-        date = self.all_bars[-1].date if contract == self.contract else None
+        try:
+            date = self.all_bars[-1].date if contract == self.contract else None
+        except IndexError:
+            date = None
         BarStreamer.__call__(self, ib, contract, date)
         if self.avg_periods:
             self.volume = self.reset_volume(self.avg_periods)
@@ -158,12 +160,22 @@ class VolumeStreamer(StreamAggregator):
             self.span = len(self.bars)
         df = util.df(bars)
         # last 5 days
-        volume = df.iloc[-7125:].volume.rolling(avg_periods).sum() \
+        volume = df.iloc[-14100:].volume.rolling(avg_periods).sum() \
             .mean().round()
         log.debug(f'volume: {volume}')
         return volume
 
+    @staticmethod
+    def verify(bar: BarData) -> bool:
+        """
+        Faulty bar often comes with volume = -1 or barCount = -1.
+        """
+        return (bar.volume >= 0) and (bar.barCount >= 0)
+
     def aggregate(self, bar: BarData) -> None:
+        if not self.verify(bar):
+            log.warning(f'Faulty bar for: {self.contract.localSymbol} {bar}')
+            return
         self.new_bars.append(bar)
         self.all_bars.append(bar)
         self.aggregator += bar.volume

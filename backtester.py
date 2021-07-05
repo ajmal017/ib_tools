@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from datetime import datetime
 from itertools import count
 import pickle
@@ -9,25 +8,22 @@ from typing import (NamedTuple, List, Dict, Any, Union, Tuple, Type, Optional,
 import pandas as pd
 import numpy as np
 from logbook import Logger
-
 from ib_insync import IB as master_IB
 from ib_insync import util
 from ib_insync.contract import Future, ContFuture, Contract
-from ib_insync.objects import (BarData, BarDataList, ContractDetails,
-                               TradeLogEntry, Position, CommissionReport,
-                               Execution, Fill)
-from ib_insync.order import OrderStatus, Trade, MarketOrder, Order
-from eventkit import Event
+from ib_insync import (BarData, BarDataList, ContractDetails, TradeLogEntry,
+                       Position, CommissionReport, Execution, Fill,
+                       OrderStatus, Trade, MarketOrder, Order, Event)
 
 from datastore import Store
-from trader import Manager
+from manager import Manager
 
 log = Logger(__name__)
 util.patchAsyncio()
 
 
 class IB:
-    path = 'b_temp'
+    path = '/home/tomek/ib_data/b_temp'
 
     events = ('barUpdateEvent', 'newOrderEvent', 'orderModifyEvent',
               'cancelOrderEvent', 'orderStatusEvent')
@@ -43,6 +39,7 @@ class IB:
         self.index = index
         self.field = field
         self.market = Market()
+        self._contracts = []
         self._createEvents()
         self.id = count(1, 1)
 
@@ -116,6 +113,8 @@ class IB:
                     c.exchange = contract.exchange
                 contract.update(**c.dict())
                 result.append(contract)
+        # keep track of all contracts for which details must be obtained
+        self._contracts.extend(result)
         return result
 
     def reqCommissionsFromIB(self, contracts: List) -> Dict:
@@ -131,12 +130,15 @@ class IB:
         commissions.update(self.getCommissionBySymbol(missing_commissions))
         return commissions
 
-    def getCommissionBySymbol(self, commissions: List) -> Dict:
+    def getCommissionBySymbol(self, commissions: List[Contract]
+                              ) -> Dict[str, Any]:
         with open(f'{self.path}/commissions_by_symbol.pickle', 'rb') as f:
             c = pickle.load(f)
         return {comm: c.get(comm) for comm in commissions}
 
-    def reqCommissionsFromDB(self, contracts: List) -> Dict:
+    def reqCommissionsFromDB(self, contracts: List[Contract]
+                             ) -> Dict[str, Any]:
+        log.debug(f'requesting metadata for contracts: {contracts}')
         return {contract.symbol: self.store.read_metadata(contract
                                                           )['commission']
                 for contract in contracts}
@@ -149,14 +151,19 @@ class IB:
                           useRTH: str,
                           endDateTime: str = '',
                           formatDate: int = 1,
-                          keepUpToDate: bool = True
+                          keepUpToDate: bool = True,
+                          **kwargs
                           ):
         return self.datasource(contract, durationStr, barSizeSetting)
 
     reqHistoricalDataAsync = reqHistoricalData
 
     def positions(self):
-        return self.market.account.positions.values()
+        try:
+            return self.market.account.positions.values()
+        except AttributeError:
+            # this is before Account has been instantiated
+            return {}
 
     def accountValues(self):
         log.info(f'cash: {self.market.account.cash}')
@@ -171,7 +178,7 @@ class IB:
         return [v for v in self.market.trades
                 if v.orderStatus.status not in OrderStatus.DoneStates]
 
-    def placeOrder(self, contract, order):
+    def placeOrder(self, contract: Contract, order: Order) -> Trade:
         orderId = order.orderId or next(self.id)
         now = self.market.date
         trade = self.market.get_trade(order)
@@ -187,55 +194,48 @@ class IB:
             assert order.totalQuantity != 0, 'Order quantity cannot be zero'
             order.orderId = orderId
             order.permId = orderId
-            orderStatus = OrderStatus(status=OrderStatus.PendingSubmit,
-                                      remaining=order.totalQuantity)
+            if order.parentId:
+                # this is for bracket order implementation TODO
+                orderStatus = OrderStatus(status=OrderStatus.PreSubmitted,
+                                          remaining=order.totalQuantity)
+                log.error('Why the fuck are we here?')
+            else:
+                orderStatus = OrderStatus(status=OrderStatus.Submitted,
+                                          remaining=order.totalQuantity)
             logEntry = TradeLogEntry(now, orderStatus, '')
             trade = Trade(contract, order, orderStatus, [], [logEntry])
             self.newOrderEvent.emit(trade)
             self.market.append_trade(trade)
         return trade
 
-    def cancelOrder(self, order):
-        now = self.market.date
+    def cancelOrder(self, order: Order) -> None:
         trade = self.market.get_trade(order)
         if trade:
-            if not trade.isDone():
-                # this is a placeholder for implementation of further methods
-                status = trade.orderStatus.status
-                if (status == OrderStatus.PendingSubmit and not order.transmit
-                        or status == OrderStatus.Inactive):
-                    newStatus = OrderStatus.Cancelled
-                else:
-                    newStatus = OrderStatus.Cancelled
-                logEntry = TradeLogEntry(now, newStatus, '')
-                trade.log.append(logEntry)
-                trade.orderStatus.status = newStatus
-                trade.cancelEvent.emit(trade)
-                trade.statusEvent.emit(trade)
-                self.cancelOrderEvent.emit(trade)
-                self.orderStatusEvent.emit(trade)
-                if newStatus == OrderStatus.Cancelled:
-                    trade.cancelledEvent.emit(trade)
+            self.market.cancel_trade(trade)
+            self.cancelOrderEvent.emit(trade)
+            self.orderStatusEvent.emit(trade)
         else:
             log.error(f'cancelOrder: Unknown orderId {order.orderId}')
 
     def run(self):
-        # This is a monkey fucking patch, needs to be redone TODO
+        # TODO
+        # This is a fucking monkey patch, needs to be redone
         if self.mode == 'use_ib':
             commissions = self.reqCommissionsFromIB(
-                self.market.ib_objects.values())
+                self._contracts)
             commissions = {k: v.commission for k, v in commissions.items()}
         elif self.mode == 'db_only':
+            log.debug(f'About to request commissions for {self._contracts}')
             commissions = self.reqCommissionsFromDB(
-                self.market.ib_objects.values())
+                self._contracts)
         else:
-            raise ValueError(f'Mode should be one of "use_ib" or "db_only"')
+            raise ValueError('Mode should be one of "use_ib" or "db_only"')
 
         self.market.commissions = commissions
 
         self.market.ticks = {
             cont.symbol: self.reqContractDetails(cont)[0].minTick
-            for cont in self.market.ib_objects.values()}
+            for cont in self._contracts}
         log.debug(f'market.object.keys: {self.market.objects.keys()}')
         log.debug(f'properties set on Market: {self.market}')
         log.debug(f'commissions: {self.market.commissions}')
@@ -289,9 +289,9 @@ class DataSource:
     start_date: ClassVar[Optional[str]] = None
     end_date: ClassVar[Optional[str]] = None
     store: ClassVar[Optional[Store]] = None
-    _timedelta: ClassVar[Optional[pd.Timedelta]] = None
-    _df: ClassVar[Optional[pd.DataFrame]] = None
-    _data: ClassVar[Optional[Dict]] = None
+    _timedelta: Optional[pd.Timedelta] = None
+    _df: Optional[pd.DataFrame] = None
+    _data: Optional[Dict] = None
 
     def __init__(self, contract: Contract, durationStr: str,
                  barSizeSetting: str) -> None:
@@ -527,8 +527,8 @@ class _Market:
         if len(duplicates) != 0:
             log.error(f'index duplicates: {duplicates}')
         self.date = self.index[0]
-        self.objects[source.contract.tradingClass] = source
-        self.ib_objects[source.contract.tradingClass] = source.contract
+        self.objects[source.contract.symbol] = source
+        self.ib_objects[source.contract.symbol] = source.contract
 
     def date_generator(self):
         """
@@ -584,7 +584,7 @@ class _Market:
             else:
                 day = self.date.day
 
-    def simulate_data_point(self):
+    def simulate_data_point(self) -> None:
         """
         Emit prices available at given data point.
         Test if any orders should be executed. Mark to market.
@@ -595,14 +595,28 @@ class _Market:
         self.account.mark_to_market(self.prices)
         self.run_orders()
         log.debug(f'current date: {self.date}')
-        log.debug(f'current prices: {self.prices}')
+        # for k, v in self.prices.items():
+        #    log.debug(f'current price: {k}: open: {v.open}, high: {v.high}, '
+        #              f'low: {v.low}, close: {v.close}')
 
-    def post_mortem(self):
+    def close_all_positions(self) -> None:
+        """
+        Run after finalizing the simulation to account for mark to market
+        impact of final open positions.
+        TODO
+        """
+        pass
+
+    def post_mortem(self) -> None:
         """Summary after simulation"""
-        log.debug(f'Final cash position: {self.account.cash}')
-        log.debug(f'Open positions: {self.account.positions}')
+        log.info(f'Final cash position: {self.account.cash}')
+        log.info(f'Mark to market on open positions: '
+                 f'{sum(self.account.mtm.values())}')
+        log.info(f'Open positions: {self.account.positions}')
+        self.manager.trader.blotter.save()
+        self.manager.freeze()
 
-    def reboot(self):
+    def reboot(self) -> None:
         """
         Simulate system reboot. Typically performed at the end of each day.
         All pending events are cancelled on reboot to mimick real app.
@@ -625,12 +639,12 @@ class _Market:
         if position:
             avgCost = position.avgCost
             if isinstance(trade.contract, (Future, ContFuture)):
-                price = avgCost / int(trade.contract.multiplier)
+                price = avgCost / float(trade.contract.multiplier)
             else:
                 price = avgCost
         else:
-            log.warning(f'trail order without corresponding position')
-            price = self.prices[trade.contract.tradingClass].open
+            log.error(f'trail order without corresponding position')
+            price = self.prices[trade.contract.symbol].open
 
         if trade.order.action.upper() == 'BUY':
             trade.order.trailStopPrice = price + trade.order.auxPrice
@@ -645,15 +659,96 @@ class _Market:
         for contract, bars in self.objects.items():
             if bars.bar(self.date) is not None:
                 self.prices[contract] = bars.bar(self.date)
+                # dirty hack to include micro contracts
+                # TODO fix
+                self.prices[f'M{contract}'] = bars.bar(self.date)
+
+    def parent_is_done(self, trade: Trade) -> bool:
+        """
+        Not in use. Bracketing implementation work in progress.
+        """
+        parentId = trade.order.parentId
+        if parentId:
+            for trade in self.trades:
+                if trade.order.orderId == parentId:
+                    parent = trade
+            return parent.isDone()
+        else:
+            return True
 
     def run_orders(self) -> None:
         open_trades = [trade for trade in self.trades if not trade.isDone()]
         for trade in open_trades.copy():
+            self.validate_order_trigger(
+                trade.order, self.prices[trade.contract.symbol])
             price_or_bool = self.validate_order(
                 trade.order,
-                self.prices[trade.contract.tradingClass])
+                self.prices[trade.contract.symbol])
             if price_or_bool:
-                self.execute_trade(trade, price_or_bool)
+                executed = self.execute_trade(trade, price_or_bool)
+                open_trades.remove(executed)
+                # cancel any linked orders
+                linked = []
+                if executed.order.ocaGroup:
+                    linked.extend(self.find_oca(executed, open_trades))
+                elif executed.order.parentId:
+                    linked.extend(self.find_bracket(
+                        executed, open_trades))
+                log.debug(f'linked orders to be cancelled: {linked}')
+                for t in linked:
+                    self.cancel_trade(t)
+
+    @staticmethod
+    def find_oca(trade: Trade, open_trades: List[Trade]) -> List[Trade]:
+        oca = trade.order.ocaGroup
+        log.debug(f'veryfing open trades: {open_trades} for {oca}')
+        return [t for t in open_trades if t.order.ocaGroup == oca]
+
+    @staticmethod
+    def find_bracket(trade: Trade, open_trades: List[Trade]) -> List[Trade]:
+        raise NotImplementedError
+
+    @staticmethod
+    def validate_order_trigger(order: Order, price: BarData) -> None:
+        """
+        Verify if adjustable order triggered modification. If so
+        modify order in place.
+        """
+        # order doesn't have a trigger price (default value)
+        if order.triggerPrice == 1.7976931348623157e+308:
+            # log.debug('validate_order_trigger returned')
+            return
+        log.error('Order trigger executed')
+
+        if (
+            (order.action.upper() == 'BUY' and order.triggerPrice >= price.low)
+                or
+            (order.action.upper() == 'SELL' and order.triggerPrice <= price.high)
+        ):
+            order.orderType = order.adjustedOrderType
+            if order.orderType == 'STP':
+                order.auxPrice = order.adjustedStopPrice
+            elif order.orderType == 'TRAIL':
+                order.trailStopPrice = order.adjustedStopPrice
+                # works only in absolute units (precent - TODO)
+                order.auxPrice = order.adjustedTrailingAmount
+            # prevent future trigger verification
+            order.triggerPrice = 1.7976931348623157e+308
+            log.debug(f'Order adjusted: {order}')
+
+    def cancel_trade(self, trade: Trade) -> None:
+        log.debug(f'will cancel trade: {trade}')
+        now = self.date
+        if not trade.isDone():
+            newStatus = OrderStatus.Cancelled
+            logEntry = TradeLogEntry(now, newStatus, '')
+            trade.log.append(logEntry)
+            trade.orderStatus.status = newStatus
+            trade.cancelEvent.emit(trade)
+            trade.statusEvent.emit(trade)
+            trade.cancelledEvent.emit(trade)
+            log.debug(f'cancelled trade: {trade}')
+            log.debug(f'isDone: {trade.isDone()}')
 
     def validate_order(self, order: Order, price: BarData
                        ) -> Union[bool, float]:
@@ -677,7 +772,7 @@ class _Market:
                  'TRAIL': self.validate_trail}
         return funcs[order.orderType](order, price)
 
-    def execute_trade(self, trade: Trade, price: float) -> None:
+    def execute_trade(self, trade: Trade, price: float) -> Trade:
         """
         After order is validated (ie. it should be executed), do the actual
         execution. Execution price is passed as argument.
@@ -710,6 +805,7 @@ class _Market:
         trade.fillEvent.emit(trade, trade.fills[-1])
         trade.filledEvent.emit(trade)
         self.update_commission(executed_trade, net_pnl, commission)
+        return trade
 
     @staticmethod
     def apply_slippage(price: float, tick: float, action: str) -> float:
@@ -728,9 +824,9 @@ class _Market:
     @staticmethod
     def validate_limit(order: Order, price: BarData) -> Union[bool, float]:
         price = (price.open, price.high, price.low, price.close)
-        if order.action.upper() == 'BUY' and order.lmtPrice <= min(price):
+        if order.action.upper() == 'BUY' and order.lmtPrice >= min(price):
             return order.lmtPrice
-        if order.action.upper() == 'SELL' and order.lmtPrice >= max(price):
+        if order.action.upper() == 'SELL' and order.lmtPrice <= max(price):
             return order.lmtPrice
         return False
 
@@ -777,7 +873,7 @@ class _Market:
                     execution=execution,
                     commissionReport=commission)
         trade.fills.append(fill)
-        trade.orderStatus = OrderStatus(status='Filled',
+        trade.orderStatus = OrderStatus(status=OrderStatus.Filled,
                                         filled=quantity,
                                         remaining=0,
                                         avgFillPrice=price,
@@ -823,7 +919,7 @@ class Account:
         position = quantity if side == 'BUY' else -quantity
         avgCost = (price
                    if not isinstance(contract, (Future, ContFuture))
-                   else price * int(contract.multiplier))
+                   else price * float(contract.multiplier))
         return TradeParams(contract, quantity, price, side, position,
                            avgCost)
 
@@ -834,7 +930,7 @@ class Account:
         log.debug(f'positions: {positions}')
         for contract, position in self.positions.items():
             self.mtm[contract] = position.position * (
-                prices[contract].average * int(position.contract.multiplier)
+                prices[contract].average * float(position.contract.multiplier)
                 - position.avgCost)
             log.debug(f'mtm: {contract} {self.mtm[contract]}')
 

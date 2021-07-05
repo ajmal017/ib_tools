@@ -1,10 +1,12 @@
 from abc import ABC, abstractmethod
-from typing import List, Dict, Union, Optional, Tuple, Any, DefaultDict
+from typing import List, Dict, Union, Optional, Any, DefaultDict
 from functools import partial
+from datetime import datetime
 from collections import defaultdict
 import pickle
 
 import pandas as pd
+import numpy as np
 from logbook import Logger
 from arctic.date import DateRange
 from arctic.store.versioned_item import VersionedItem
@@ -21,6 +23,9 @@ log = Logger(__name__)
 def symbol_extractor(func):
     """
     Not in use. TODO.
+
+    Decorator that handles checking if method received Contract object or
+    string. If Contract received convert it to approriate string.
     """
     def wrapper(symbol, *args, **kwargs):
         if isinstance(symbol, Contract):
@@ -153,14 +158,14 @@ class AbstractBaseStore(ABC):
         df.drop(index=df[df.index.duplicated()].index, inplace=True)
         return df
 
-    def check_earliest(self, symbol: str) -> pd.datetime:
+    def check_earliest(self, symbol: str) -> datetime:
         """Return earliest date of available data for a given symbol."""
         try:
             return self.read(symbol).index.min()
         except (KeyError, AttributeError):
             return None
 
-    def check_latest(self, symbol: str) -> pd.datetime:
+    def check_latest(self, symbol: str) -> datetime:
         """Return earliest date of available data for a given symbol."""
         try:
             return self.read(symbol).index.max()
@@ -175,7 +180,10 @@ class AbstractBaseStore(ABC):
         range = {}
         for key in self.keys():
             df = self.read(key)
-            range[key] = (df.index[0], df.index[-1])
+            try:
+                range[key] = (df.index[0], df.index[-1])
+            except IndexError:
+                range[key] = (None, None)
         return pd.DataFrame(range).T.rename(columns={0: 'from', 1: 'to'})
 
     def review(self, *field: str) -> pd.DataFrame:
@@ -202,7 +210,7 @@ class AbstractBaseStore(ABC):
         return [c for c in self.keys() if c.endswith('CONTFUT')]
 
     def _contfutures_dict(self, field: str = 'tradingClass'
-                          ) -> DefaultDict[str, Dict[pd.datetime, str]]:
+                          ) -> DefaultDict[str, Dict[datetime, str]]:
         """
         Args:
         ----------
@@ -242,25 +250,25 @@ class AbstractBaseStore(ABC):
 
         Args:
         ----------
-        index: -1 means most recent contract, -2 second most recent, etc.
+        index: standard python zero based indexing. (-1 means most recent
+        contract, -2 second most recent, 0 first, 1 second, etc.)
                 Oldest available contract if index is lower than the number of
-                available contracts.
-        field: which field of metadata dict is to be searched
+                available contracts. Latest available contract if index is
+                greater than number of contracts minus one.
+        field: which field of metadata dict is to be searched to determine
+               which contract is a contfutures.
 
         Returns:
         ----------
         Dictionary of {symbol: datastore key}
 
         """
-        if index > 0:
-            raise ValueError('index must be <= 0')
-
         _latest_contfutures = {}
         for c, d in self._contfutures_dict(field).items():
             keys_list = list(d.keys())
-            if len(keys_list) + index < 0:
-                index = 0
-            _latest_contfutures[c] = d[keys_list[index]]
+            _latest_contfutures[c] = d[keys_list[np.clip(index,
+                                                         -len(keys_list),
+                                                         (len(keys_list)-1))]]
         return _latest_contfutures
 
     def contfuture(self, symbol: str, index: int = -1,
@@ -336,7 +344,8 @@ class ArcticStore(AbstractBaseStore):
             return f'symbol: {version.symbol} version: {version.version}'
 
     def read(self, symbol: Union[str, Contract],
-             start_date: Optional[str] = None, end_date: Optional[str] = None
+             start_date: Optional[str] = None,
+             end_date: Optional[str] = None
              ) -> Optional[pd.DataFrame]:
         try:
             return self.read_object(symbol, start_date, end_date).data
@@ -434,7 +443,7 @@ class PyTablesStore(AbstractBaseStore):
 
     def keys(self) -> List[str]:
         with self.store() as store:
-            keys = store.keys()
+            keys=store.keys()
         return keys
 
     def read_metadata(self, symbol: Union[str, Contract]) -> dict:

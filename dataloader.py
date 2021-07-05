@@ -9,8 +9,9 @@ from typing import List, Union, Type, Optional
 from functools import partial
 
 import pandas as pd
-from ib_insync import IB, Contract, Future, ContFuture, BarDataList, util
-from eventkit import Event
+from ib_insync import (IB, Contract, Future, ContFuture, BarDataList, util,
+                       Event)
+from logbook import DEBUG
 
 from logger import logger
 from connect import Connection
@@ -45,23 +46,32 @@ class ContractObjectSelector:
         ).to_dict('records')
         self.ib = ib
         self.contracts = []
+        log.debug('ContractObjectSelector about to create objects')
         self.create_objects()
+        log.debug('Objects created')
 
     def create_objects(self) -> None:
         self.objects = [Contract.create(**s) for s in self.symbols]
         self.non_futures = [
             obj for obj in self.objects if not isinstance(obj, Future)]
+        log.debug(f'non-futures: {self.non_futures}')
         self.futures = [obj for obj in self.objects if isinstance(obj, Future)]
-        self.contFutures = [ContFuture(**obj.nonDefaults()
-                                       ).update(secType='CONTFUT')
-                            for obj in self.futures]
+        log.debug(f'futures: {self.futures}')
+
+        # converting Futures to ContFutures
+        self.contFutures = []
+        for obj in self.futures:
+            params = obj.nonDefaults()
+            del params['secType']
+            self.contFutures.append(ContFuture(**params))
+        log.debug(f'contfutures: {self.contFutures}')
 
     def lookup_futures(self, obj: List[Future]) -> List[Future]:
         futures = []
         for o in obj:
             o.update(includeExpired=True)
             futures.append(
-                [Future(**c.contract.dict())
+                [Contract.create(**c.contract.dict())
                  for c in self.ib.reqContractDetails(o)]
             )
         return list(itertools.chain(*futures))
@@ -307,11 +317,13 @@ class ContractHolder:
         items: Optional[List[DataWriter]] = None
 
         def get_items(self):
+            log.debug('getting items')
             objects = ContractObjectSelector(self.ib, self.source)
             if self.cont_only:
                 objects = objects.cont_list
             else:
                 objects = objects.list
+            log.debug(f'objects: {objects}')
 
             self.items = []
             for o in objects:
@@ -333,6 +345,8 @@ class ContractHolder:
                 )
 
         def __call__(self):
+            log.debug('holder called')
+            log.debug(f'items: {self.items}')
             if self.items is None:
                 self.get_items()
             return self.items
@@ -453,7 +467,7 @@ async def worker(name: str, queue: asyncio.Queue):
             f'ending {contract.next_date} '
             # f'with params: {contract.params})'
         )
-        chunk = await ib.reqHistoricalDataAsync(**contract.params)
+        chunk = await ib.reqHistoricalDataAsync(**contract.params, timeout=0)
         contract.save_chunk(chunk)
         if contract.next_date:
             await queue.put(contract)
@@ -489,16 +503,18 @@ if __name__ == '__main__':
     util.patchAsyncio()
     ib = IB()
     barSize = '30 secs'
-    wts = 'MIDPOINT'
+    wts = 'TRADES'
     # object where data is stored
     store = ArcticStore(f'{wts}_{barSize}')
 
+    # the bool is for cont_only
     holder = ContractHolder(ib, 'contracts.csv',
-                            store, wts, barSize, True)
+                            store, wts, barSize, False, aggression=1)
 
-    # asyncio.get_event_loop().set_debug(True)
-    Connection(ib, partial(main, holder), watchdog=False)
+    asyncio.get_event_loop().set_debug(True)
+    # util.logToConsole(DEBUG)
+    Connection(ib, partial(main, holder), watchdog=True)
 
     log.debug('script finished, about to disconnect')
     ib.disconnect()
-    log.debug(f'disconnected')
+    log.debug('disconnected')

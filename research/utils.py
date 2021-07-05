@@ -1,5 +1,6 @@
 from multiprocessing import Pool, cpu_count
 import sys
+sys.path.append('/home/tomek/ib_tools')  # noqa
 from collections import namedtuple
 from typing import NamedTuple, List, Union, Optional, Dict
 
@@ -9,9 +10,9 @@ import matplotlib.pyplot as plt
 
 from pyfolio.timeseries import perf_stats
 
-from grouper import group_by_volume
+from research.grouper import group_by_volume
 
-sys.path.append('/home/tomek/ib_tools')
+
 from indicators import get_ATR, get_signals  # noqa
 
 
@@ -33,7 +34,7 @@ def plot(*data):
         else:
             raise ValueError('Arguments must be Series or a Dataframe')
     # plot the charts
-    fig = plt.figure(figsize=(20, 16))
+    fig = plt.figure(figsize=(20, len(columns)*5))
     num_plots = len(columns)
     for n, p in enumerate(columns):
         if n == 0:
@@ -557,7 +558,11 @@ def true_sharpe(ret):
     """
     r = pd.Series()
     df = pd.DataFrame({'returns': ret})
+    df['cummulative_return'] = (df['returns'] + 1).cumprod()
     df['log_returns'] = np.log(df['returns']+1)
+    r['cummulative_return'] = df['cummulative_return'][-1] - 1
+    r['annual_return'] = ((r['cummulative_return'] + 1)
+                          ** (252 / len(df.index))) - 1
     r['mean'] = df['returns'].mean() * 252
     r['mean_log'] = df['log_returns'].mean() * 252
     r['vol'] = df['returns'].std() * np.sqrt(252)
@@ -565,6 +570,27 @@ def true_sharpe(ret):
     r['sharpe'] = r['mean'] / r['vol']
     r['sharpe_log'] = r['mean_log'] / r['vol_log']
     return r
+
+
+def rolling_sharpe(returns: pd.Series, months: float) -> pd.DataFrame:
+    ret = pd.DataFrame({'returns': returns})
+    ret['mean'] = ret['returns'].rolling(22*months).mean() * 252
+    ret['vol'] = ret['returns'].rolling(22*months).std() * np.sqrt(252)
+    ret['sharpe'] = (ret['mean'] / ret['vol'])
+    ret = ret.dropna()
+    return ret
+
+
+def plot_rolling_sharpe(returns: pd.Series, months: float) -> None:
+    rolling = rolling_sharpe(returns, months)
+    rolling['mean_sharpe'] = rolling['sharpe'].mean()
+    rolling[['sharpe', 'mean_sharpe']].plot(figsize=(20, 5), grid=True)
+
+
+def plot_rolling_vol(returns: pd.Series, months: float) -> None:
+    rolling = rolling_sharpe(returns, months)
+    rolling['mean_vol'] = rolling['vol'].mean()
+    rolling[['vol', 'mean_vol']].plot(figsize=(20, 5), grid=True)
 
 
 def breakout_strategy(contract: pd.DataFrame,
@@ -715,7 +741,7 @@ def summary(price: Union[pd.Series, pd.DataFrame],
         price = price.open
 
     if threshold is None:
-        threshold = [0, 3, 5, 6, 7, 10, 15, 17, 19, 20]
+        threshold = [0, 1, 3, 5, 6, 10, 15, 17, 19, 20]
     elif isinstance(threshold, (int, float)):
         threshold = [threshold]
 
